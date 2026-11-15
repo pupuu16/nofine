@@ -1,0 +1,374 @@
+# -*- coding: utf-8 -*-
+import http.server
+import json
+import os
+import webbrowser
+from urllib.parse import parse_qs, urlparse
+import joblib
+import numpy as np
+import pandas as pd
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import train_test_split
+
+PORT = 8080
+DATA_PATH = "clean_data.xlsx"
+MODEL_PATH = "rf_bcr_model.joblib"
+
+# 全局数据加载
+df = pd.DataFrame()
+model = None
+metrics = {}
+min_max = {}
+p01_p99 = {}
+
+
+def load_resources():
+  global df, model, metrics, min_max, p01_p99
+  if os.path.exists(DATA_PATH):
+    df = pd.read_excel(DATA_PATH)
+
+  if os.path.exists(MODEL_PATH):
+    loaded_obj = joblib.load(MODEL_PATH)
+    # 兼容处理：如果 joblib 保存的是字典，则提取其中的 'model'
+    if isinstance(loaded_obj, dict):
+      model = loaded_obj.get("model", None)
+    else:
+      model = loaded_obj
+
+  if not df.empty and model is not None:
+    feature_names = [
+        "水价",
+        "降雨量",
+        "变异系数",
+        "汇水面积",
+        "总建筑面积",
+        "需水量",
+        "人数",
+        "楼高",
+        "水箱容积",
+        "项目寿命",
+        "电价",
+        "贴现率",
+    ]
+    X = df[feature_names]
+    y = df["BCR"]
+
+    # 自动计算 min/max 以及 1%-99% 分位数
+    for col in feature_names:
+      min_max[col] = {"min": float(X[col].min()), "max": float(X[col].max())}
+      p01_p99[col] = {
+          "p01": float(X[col].quantile(0.01)),
+          "p99": float(X[col].quantile(0.99)),
+      }
+
+    # 计算 3:1 划分 (random_state=42) 测试集指标
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.25, random_state=42
+    )
+    y_pred = model.predict(X_test)
+    metrics["r2"] = float(r2_score(y_test, y_pred))
+    metrics["mae"] = float(mean_absolute_error(y_test, y_pred))
+    metrics["rmse"] = float(np.sqrt(mean_squared_error(y_test, y_pred)))
+
+
+# 将随机森林树结构转为前端 JS 调用的字典格式
+def export_rf_to_dict(rf_model):
+  trees_data = []
+  for tree in rf_model.estimators_:
+    t_ = tree.tree_
+    tree_dict = {
+        "children_left": t_.children_left.tolist(),
+        "children_right": t_.children_right.tolist(),
+        "feature": t_.feature.tolist(),
+        "threshold": t_.threshold.tolist(),
+        "value": t_.value[:, 0, 0].tolist(),
+    }
+    trees_data.append(tree_dict)
+  return trees_data
+
+
+HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>屋面雨水回收（RWH）经济性预测工具</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: "Microsoft YaHei", sans-serif; }
+        body { background: #f4f6f9; color: #333; display: flex; height: 100vh; overflow: hidden; }
+        .sidebar { width: 420px; background: #fff; border-right: 1px solid #ddd; display: flex; flex-direction: column; height: 100%; box-shadow: 2px 0 5px rgba(0,0,0,0.05); }
+        .sidebar-header { padding: 20px; background: #1890ff; color: #fff; font-size: 18px; font-weight: bold; text-align: center; }
+        .sidebar-body { padding: 20px; overflow-y: auto; flex: 1; }
+        .form-group { margin-bottom: 15px; }
+        .form-group label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 5px; color: #555; }
+        .form-group input { width: 100%; padding: 8px 12px; border: 1px solid #d9d9d9; border-radius: 4px; font-size: 14px; }
+        .form-group input:focus { border-color: #1890ff; outline: none; box-shadow: 0 0 4px rgba(24,144,255,0.2); }
+        .btn-calc { width: 100%; padding: 12px; background: #1890ff; color: #fff; border: none; border-radius: 4px; font-size: 16px; font-weight: bold; cursor: pointer; margin-top: 10px; }
+        .btn-calc:hover { background: #40a9ff; }
+        
+        .main-content { flex: 1; padding: 30px; overflow-y: auto; display: flex; flex-direction: column; gap: 20px; }
+        .card { background: #fff; border-radius: 8px; padding: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); }
+        .card h3 { font-size: 16px; margin-bottom: 15px; color: #1890ff; border-bottom: 2px solid #f0f2f5; padding-bottom: 8px; }
+        
+        .result-box { display: flex; gap: 20px; align-items: center; }
+        .result-item { flex: 1; background: #fafafa; padding: 15px; border-radius: 6px; text-align: center; border: 1px solid #f0f2f5; }
+        .result-val { font-size: 28px; font-weight: bold; color: #333; margin-top: 5px; }
+        .feasible { color: #52c41a !important; }
+        .infeasible { color: #ff4d4f !important; }
+        
+        .warning-box { background: #fffbe6; border: 1px solid #ffe58f; padding: 12px; border-radius: 4px; color: #faad14; font-size: 13px; margin-top: 10px; display: none; }
+        
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px; }
+        th, td { border: 1px solid #e8e8e8; padding: 8px 10px; text-align: center; }
+        th { background: #fafafa; font-weight: 600; }
+        .metrics-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; }
+        .metric-box { background: #f6ffed; border: 1px solid #b7eb8f; padding: 12px; border-radius: 6px; text-align: center; }
+        .metric-val { font-size: 20px; font-weight: bold; color: #52c41a; margin-top: 4px; }
+    </style>
+</head>
+<body>
+
+<div class="sidebar">
+    <div class="sidebar-header">屋面雨水回收(RWH)经济性预测</div>
+    <div class="sidebar-body">
+        <div id="form-container"></div>
+        <button class="btn-calc" onclick="runPrediction()">立即预测与分析</button>
+    </div>
+</div>
+
+<div class="main-content">
+    <div class="card">
+        <h3>预测判定结果</h3>
+        <div class="result-box">
+            <div class="result-item">
+                <div>预测 BCR 值</div>
+                <div class="result-val" id="res-bcr">-</div>
+            </div>
+            <div class="result-item">
+                <div>经济判定 (以1为界)</div>
+                <div class="result-val" id="res-status">-</div>
+            </div>
+        </div>
+        <div id="warning-panel" class="warning-box">⚠️ 警告：当前输入部分指标超出了历史数据的 1%-99% 分位范围，预测结果存在外推风险！</div>
+    </div>
+
+    <div class="card">
+        <h3>模型结果校验面板 (测试集 3:1 划分, random_state=42)</h3>
+        <div class="metrics-grid">
+            <div class="metric-box">
+                <div>R² 决定系数</div>
+                <div class="metric-val" id="m-r2">-</div>
+            </div>
+            <div class="metric-box">
+                <div>MAE 平均绝对误差</div>
+                <div class="metric-val" id="m-mae">-</div>
+            </div>
+            <div class="metric-box">
+                <div>RMSE 均方根误差</div>
+                <div class="metric-val" id="m-rmse">-</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="card">
+        <h3>与当前输入最相似的 3 个历史项目</h3>
+        <table>
+            <thead>
+                <tr>
+                    <th>序号</th>
+                    <th>水价</th>
+                    <th>降雨量</th>
+                    <th>总建筑面积</th>
+                    <th>需水量</th>
+                    <th>真实 BCR</th>
+                </tr>
+            </thead>
+            <tbody id="similar-tbody">
+                <tr><td colspan="6">暂无数据</td></tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<script>
+const featureMeta = [
+    { key: '水价', label: '水价 (USD/m³)', default: 0.45 },
+    { key: '降雨量', label: '降雨量 (mm)', default: 1700 },
+    { key: '变异系数', label: '变异系数', default: 1.2 },
+    { key: '汇水面积', label: '汇水面积 (m²)', default: 800 },
+    { key: '总建筑面积', label: '总建筑面积 (m²)', default: 6000 },
+    { key: '需水量', label: '需水量 (m³/d)', default: 12 },
+    { key: '人数', label: '人数 (人)', default: 120 },
+    { key: '楼高', label: '楼高 (m)', default: 18 },
+    { key: '水箱容积', label: '水箱容积 (m³)', default: 40 },
+    { key: '项目寿命', label: '项目寿命 (年)', default: 30 },
+    { key: '电价', label: '电价 (USD/kWh)', default: 0.10 },
+    { key: '贴现率', label: '贴现率 (%%)', default: 4.5 }
+];
+
+let appData = {};
+
+window.onload = async function() {
+    let res = await fetch('/api/init');
+    appData = await res.json();
+    
+    let formHtml = '';
+    featureMeta.forEach(feat => {
+        let mm = appData.min_max[feat.key] || {min: 0, max: 100};
+        formHtml += `
+            <div class="form-group">
+                <label>${feat.label} [范围: ${mm.min.toFixed(1)} ~ ${mm.max.toFixed(1)}]</label>
+                <input type="number" step="any" id="input-${feat.key}" value="${feat.default}">
+            </div>
+        `;
+    });
+    document.getElementById('form-container').innerHTML = formHtml;
+    
+    document.getElementById('m-r2').innerText = appData.metrics.r2.toFixed(4);
+    document.getElementById('m-mae').innerText = appData.metrics.mae.toFixed(4);
+    document.getElementById('m-rmse').innerText = appData.metrics.rmse.toFixed(4);
+    
+    runPrediction();
+};
+
+function predictTree(tree, x) {
+    let node = 0;
+    while (tree.children_left[node] !== -1) {
+        let featIdx = tree.feature[node];
+        let thresh = tree.threshold[node];
+        if (x[featIdx] <= thresh) {
+            node = tree.children_left[node];
+        } else {
+            node = tree.children_right[node];
+        }
+    }
+    return tree.value[node];
+}
+
+function predictRF(trees, x) {
+    let sum = 0;
+    for (let i = 0; i < trees.length; i++) {
+        sum += predictTree(trees[i], x);
+    }
+    return sum / trees.length;
+}
+
+function runPrediction() {
+    let x = [];
+    let isOutlier = false;
+    
+    featureMeta.forEach(feat => {
+        let val = parseFloat(document.getElementById(`input-${feat.key}`).value);
+        x.push(val);
+        
+        let p = appData.p01_p99[feat.key];
+        if (val < p.p01 || val > p.p99) {
+            isOutlier = true;
+        }
+    });
+    
+    let bcr = predictRF(appData.trees, x);
+    
+    document.getElementById('res-bcr').innerText = bcr.toFixed(2);
+    let statusEl = document.getElementById('res-status');
+    if (bcr >= 1.0) {
+        statusEl.innerText = '经济可行';
+        statusEl.className = 'result-val feasible';
+    } else {
+        statusEl.innerText = '经济不可行';
+        statusEl.className = 'result-val infeasible';
+    }
+    
+    let warningPanel = document.getElementById('warning-panel');
+    if (isOutlier) {
+        warningPanel.style.display = 'block';
+    } else {
+        warningPanel.style.display = 'none';
+    }
+    
+    let similar = findSimilarProjects(x);
+    let tbodyHtml = '';
+    similar.forEach((item, idx) => {
+        tbodyHtml += `
+            <tr>
+                <td>${idx + 1}</td>
+                <td>${item['水价']}</td>
+                <td>${item['降雨量']}</td>
+                <td>${item['总建筑面积']}</td>
+                <td>${item['需水量']}</td>
+                <td><b>${item['BCR'].toFixed(2)}</b></td>
+            </tr>
+        `;
+    });
+    document.getElementById('similar-tbody').innerHTML = tbodyHtml;
+}
+
+function findSimilarProjects(x) {
+    let rawData = appData.raw_data;
+    let keys = featureMeta.map(f => f.key);
+    
+    let distances = rawData.map((row, idx) => {
+        let dist = 0;
+        keys.forEach((k, i) => {
+            let mm = appData.min_max[k];
+            let span = (mm.max - mm.min) || 1;
+            let diff = (row[k] - x[i]) / span;
+            dist += diff * diff;
+        });
+        return { index: idx, dist: Math.sqrt(dist), row: row };
+    });
+    
+    distances.sort((a, b) => a.dist - b.dist);
+    return distances.slice(0, 3).map(d => d.row);
+}
+</script>
+</body>
+</html>
+"""
+
+
+class RWHHandler(http.server.BaseHTTPRequestHandler):
+
+  def do_GET(self):
+    parsed_path = urlparse(self.path)
+    if parsed_path.path == "/":
+      self.send_response(200)
+      self.send_header("Content-Type", "text/html; charset=utf-8")
+      self.end_headers()
+      self.wfile.write(HTML_TEMPLATE.encode("utf-8"))
+    elif parsed_path.path == "/api/init":
+      self.send_response(200)
+      self.send_header("Content-Type", "application/json; charset=utf-8")
+      self.end_headers()
+
+      trees_data = export_rf_to_dict(model) if model is not None else []
+      payload = {
+          "min_max": min_max,
+          "p01_p99": p01_p99,
+          "metrics": metrics,
+          "raw_data": df.to_dict(orient="records") if not df.empty else [],
+          "trees": trees_data,
+      }
+      self.wfile.write(json.dumps(payload).encode("utf-8"))
+    else:
+      self.send_response(404)
+      self.end_headers()
+
+  def log_message(self, format, *args):
+    pass
+
+     
+def run_server():
+  load_resources()
+  server_address = ("", PORT)
+  httpd = http.server.HTTPServer(server_address, RWHHandler)
+  url = f"http://localhost:{PORT}"
+  print(f"[*] 屋面雨水回收经济性预测工具已启动: {url}")
+  webbrowser.open(url)
+  try:
+    httpd.serve_forever()
+  except KeyboardInterrupt:
+    print("\n[*] 服务已关闭")
+
+
+if __name__ == "__main__":
+  run_server()
